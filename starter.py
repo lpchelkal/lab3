@@ -13,7 +13,6 @@ from fastapi import Depends, FastAPI, Query, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-
 # --- Конфиг ---------------------------------------------------------------
 
 class Settings(BaseModel):
@@ -100,6 +99,10 @@ class TicketPage(BaseModel):
     page_size: int
 
 
+class TicketDeleted(BaseModel):
+    detail: str
+
+
 # --- Репозиторий --------------------------------------------------------------
 
 class TicketRepository:
@@ -110,21 +113,28 @@ class TicketRepository:
         self._next_id = 1
 
     def add(self, ticket: Ticket) -> Ticket:
-        raise NotImplementedError
+        self._tickets[ticket.id] = ticket
+        return ticket
 
     def get(self, ticket_id: int) -> Ticket:
         # TODO: вернуть тикет или поднять TicketNotFoundError
-        raise NotImplementedError
+        ticket = self._tickets.get(ticket_id)
+        if ticket is None:
+            raise TicketNotFoundError(ticket_id)
+        return ticket
 
     def list_all(self) -> list[Ticket]:
-        raise NotImplementedError
+        return list(self._tickets.values())
 
     def update(self, ticket: Ticket) -> Ticket:
-        raise NotImplementedError
+        self._tickets[ticket.id] = ticket
+        return ticket
 
     def delete(self, ticket_id: int) -> None:
         # TODO: удалить тикет или поднять TicketNotFoundError
-        raise NotImplementedError
+        if ticket_id not in self._tickets:
+            raise TicketNotFoundError(ticket_id)
+        del self._tickets[ticket_id]
 
     def next_id(self) -> int:
         ticket_id = self._next_id
@@ -140,7 +150,16 @@ class TicketService:
         self._settings = settings
 
     def create_ticket(self, payload: TicketCreate) -> Ticket:
-        raise NotImplementedError
+        ticket = Ticket(
+            id=self._repository.next_id(),
+            title=payload.title,
+            description=payload.description,
+            priority=payload.priority,
+            status=TicketStatus.open,
+            assignee=payload.assignee,
+            created_at=datetime.now()
+        )
+        return self._repository.add(ticket)
 
     def get_ticket(self, ticket_id: int) -> Ticket:
         return self._repository.get(ticket_id)
@@ -155,12 +174,33 @@ class TicketService:
         # TODO: применить page_size из settings, если не передан,
         #  ограничить его settings.max_page_size, отсортировать список
         #  и вернуть нужную страницу
-        raise NotImplementedError
+        settings = get_settings()
+        ps = min(page_size, settings.max_page_size) if page_size is not None else settings.default_page_size
+        priority_order:dict[Priority, int] = {Priority.low: 0, Priority.normal: 1, Priority.high: 2, Priority.urgent: 3}
+        resl: list[Ticket] = self._repository.list_all()
+        if sort_by=="priority":
+            resl.sort(key=lambda t: priority_order[t.priority], reverse=(order=="desc"))
+        else:
+            resl.sort(key=lambda t: t.created_at, reverse=(order=="desc"))
+        total = len(resl)
+        resl = resl[(page-1)*ps: (page-1)*ps+ps]
+        res: TicketPage = TicketPage(items=resl, total=total, page=page, page_size=ps)
+        return res
 
     def update_ticket(self, ticket_id: int, changes: TicketUpdate) -> Ticket:
         # TODO: применить изменения, при смене статуса проверить
         # ALLOWED_TRANSITIONS и поднять InvalidStatusTransitionError
-        raise NotImplementedError
+        ticket = self._repository.get(ticket_id)
+        updates = changes.model_dump(exclude_unset=True)
+
+        new_status = updates.get("status")
+        if (
+            new_status is not None and new_status not in ALLOWED_TRANSITIONS[ticket.status]
+        ):
+            raise InvalidStatusTransitionError(ticket.status, new_status)
+
+        updated = ticket.model_copy(update=updates)
+        return self._repository.update(updated)
 
     def delete_ticket(self, ticket_id: int) -> None:
         self._repository.delete(ticket_id)
@@ -194,7 +234,7 @@ def handle_not_found(request: Request, exc: TicketNotFoundError) -> JSONResponse
 
 @app.exception_handler(InvalidStatusTransitionError)
 def handle_invalid_transition(request: Request, exc: InvalidStatusTransitionError) -> JSONResponse:
-    return JSONResponse(status_code=status.HTTP_409_CONFLICT, content={"detail": str(exc)})
+    return JSONResponse(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, content={"detail": str(exc)})
 
 
 @app.post(
@@ -205,7 +245,7 @@ def handle_invalid_transition(request: Request, exc: InvalidStatusTransitionErro
     summary="Создать тикет",
 )
 def create_ticket(payload: TicketCreate, service: TicketService = Depends(get_service)):
-    raise NotImplementedError
+    return service.create_ticket(payload)
 
 
 @app.get(
@@ -221,7 +261,7 @@ def list_tickets(
     page_size: int | None = Query(None, ge=1),
     service: TicketService = Depends(get_service),
 ):
-    raise NotImplementedError
+    return service.list_tickets(sort_by, order, page, page_size)
 
 
 @app.get(
@@ -245,14 +285,16 @@ def update_ticket(
     changes: TicketUpdate,
     service: TicketService = Depends(get_service),
 ):
-    raise NotImplementedError
+    return service.update_ticket(ticket_id, changes)
 
 
 @app.delete(
     "/tickets/{ticket_id}",
-    status_code=status.HTTP_204_NO_CONTENT,
+    response_model=TicketDeleted,
+    status_code=status.HTTP_200_OK,
     tags=["tickets"],
     summary="Удалить тикет",
 )
 def delete_ticket(ticket_id: int, service: TicketService = Depends(get_service)):
     service.delete_ticket(ticket_id)
+    return TicketDeleted(detail=f"Тикет {ticket_id} удалён")
